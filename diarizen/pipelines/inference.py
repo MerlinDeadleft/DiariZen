@@ -28,8 +28,7 @@ from pyannote.audio import Model
 try:
     from omegaconf.listconfig import ListConfig
     from omegaconf.dictconfig import DictConfig
-    from omegaconf.base import ContainerMetadata
-    torch.serialization.add_safe_globals([ListConfig, DictConfig, ContainerMetadata])
+    torch.serialization.add_safe_globals([ListConfig, DictConfig])
 except ImportError:
     # If omegaconf isn't installed yet, we skip (it will be handled by deps)
     pass
