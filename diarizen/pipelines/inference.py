@@ -21,6 +21,29 @@ from pyannote.database.protocol.protocol import ProtocolFile
 
 from diarizen.pipelines.utils import scp2path
 
+from pyannote.audio import Model
+
+# Store the original method so we can call it after modifying the data
+original_from_pretrained = Model.from_pretrained
+
+@classmethod
+def _patched_from_pretrained(cls, checkpoint_path, **kwargs):
+    # Load the checkpoint manually to inspect metadata
+    # We use map_location="cpu" to avoid moving data to GPU twice
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    # BUT-FIT models lack the 'pyannote.audio' key required by pyannote 4.0+
+    if "pyannote.audio" not in checkpoint:
+        # Inject the missing version metadata
+        checkpoint["pyannote.audio"] = {"versions": {"pyannote.audio": "3.1.1"}}
+        # Pass the modified checkpoint directly to the original loader via kwargs
+        kwargs["checkpoint"] = checkpoint
+
+    return original_from_pretrained(checkpoint_path, **kwargs)
+
+
+# Replace the original method with our patched version
+Model.from_pretrained = _patched_from_pretrained
 
 class DiariZenPipeline(SpeakerDiarizationPipeline):
     def __init__(
