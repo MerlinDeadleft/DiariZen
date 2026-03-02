@@ -30,7 +30,7 @@ original_from_pretrained = Model.from_pretrained
 def patched_from_pretrained(cls, checkpoint_path, **kwargs):
     # Load the checkpoint manually to inspect metadata
     # We use map_location="cpu" to avoid moving data to GPU twice
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # BUT-FIT models lack the 'pyannote.audio' key required by pyannote 4.0+
     if "pyannote.audio" not in checkpoint:
