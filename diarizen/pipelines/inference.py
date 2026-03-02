@@ -27,7 +27,7 @@ from pyannote.audio import Model
 original_from_pretrained = Model.from_pretrained
 
 @classmethod
-def _patched_from_pretrained(cls, checkpoint_path, **kwargs):
+def patched_from_pretrained(cls, checkpoint_path, **kwargs):
     # Load the checkpoint manually to inspect metadata
     # We use map_location="cpu" to avoid moving data to GPU twice
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -43,7 +43,7 @@ def _patched_from_pretrained(cls, checkpoint_path, **kwargs):
 
 
 # Replace the original method with our patched version
-Model.from_pretrained = _patched_from_pretrained
+Model.from_pretrained = patched_from_pretrained
 
 class DiariZenPipeline(SpeakerDiarizationPipeline):
     def __init__(
