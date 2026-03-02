@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any
 import toml
 import numpy as np
 import torch
+import torch.serialization
 import torchaudio
 
 from scipy.ndimage import median_filter
@@ -22,6 +23,15 @@ from pyannote.database.protocol.protocol import ProtocolFile
 from diarizen.pipelines.utils import scp2path
 
 from pyannote.audio import Model
+
+# Allow OmegaConf types to be loaded securely
+try:
+    from omegaconf.listconfig import ListConfig
+    from omegaconf.dictconfig import DictConfig
+    torch.serialization.add_safe_globals([ListConfig, DictConfig])
+except ImportError:
+    # If omegaconf isn't installed yet, we skip (it will be handled by deps)
+    pass
 
 # Store the original method so we can call it after modifying the data
 original_from_pretrained = Model.from_pretrained

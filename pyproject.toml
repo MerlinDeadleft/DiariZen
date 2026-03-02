@@ -62,6 +62,7 @@ dependencies = [
     "pyannote-audio",
     "torch~=2.10.0",
     "torchaudio~=2.10.0",
+    "omegaconf"
 ]
 
 [project.optional-dependencies]
