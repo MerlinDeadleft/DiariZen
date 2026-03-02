@@ -14,7 +14,7 @@ authors = [
     { name = "Jiangyu Han", email = "ihan@fit.vut.cz"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 version = "0.0.1"
 classifiers = [
     "Programming Language :: Python :: 3.10",
@@ -59,6 +59,7 @@ dependencies = [
     "tqdm",
     "accelerate==1.6.0",
     "thop",
+    "pyannote-audio"
 ]
 
 [project.optional-dependencies]
