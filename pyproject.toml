@@ -59,7 +59,9 @@ dependencies = [
     "tqdm",
     "accelerate==1.6.0",
     "thop",
-    "pyannote-audio"
+    "pyannote-audio",
+    "torch~=2.10.0",
+    "torchaudio~=2.10.0",
 ]
 
 [project.optional-dependencies]
@@ -111,3 +113,25 @@ docstring-code-line-length = 119
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'x86_64' and platform_machine != 'AMD64' and sys_platform != 'darwin'" },
+  { index = "pytorch", marker = "(platform_machine == 'x86_64' or platform_machine == 'AMD64') and sys_platform != 'darwin'" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'x86_64' and platform_machine != 'AMD64' and sys_platform != 'darwin'" },
+  { index = "pytorch", marker = "(platform_machine == 'x86_64' or platform_machine == 'AMD64') and sys_platform != 'darwin'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
