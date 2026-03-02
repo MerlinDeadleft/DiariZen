@@ -43,7 +43,7 @@ dependencies = [
     "tensorboard",
     "librosa",
     "matplotlib",
-    "numpy==1.26.4",
+    "numpy>=2.0.0",
     "onnxruntime-gpu",
     "openpyxl", # for saving results to excel
     "pandas",
