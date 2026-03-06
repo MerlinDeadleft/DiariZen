@@ -11,10 +11,12 @@ import torch.nn as nn
 
 from functools import lru_cache
 
-from pyannote.audio.core.model import Model as BaseModel
+from pyannote.audio.core.task import Problem, Resolution
+from pyannote.audio.core.model import Model as BaseModel, Specifications
+from pyannote.audio.utils.powerset import Powerset
 from pyannote.audio.utils.receptive_field import (
-    multi_conv_num_frames, 
-    multi_conv_receptive_field_size, 
+    multi_conv_num_frames,
+    multi_conv_receptive_field_size,
     multi_conv_receptive_field_center
 )
 
@@ -24,37 +26,52 @@ from diarizen.models.module.wavlm_config import get_config
 
 class Model(BaseModel):
     def __init__(
-        self,
-        wavlm_src: str = "wavlm_base",
-        wavlm_layer_num: int = 13,
-        wavlm_feat_dim: int = 768,
-        attention_in: int = 256,
-        ffn_hidden: int = 1024,
-        num_head: int = 4,
-        num_layer: int = 4,
-        kernel_size: int = 31,
-        dropout: float = 0.1,
-        use_posi: bool = False,
-        output_activate_function: str = False,
-        max_speakers_per_chunk: int = 4,
-        max_speakers_per_frame: int = 2,
-        chunk_size: int = 5,
-        num_channels: int = 8,
-        selected_channel: int = 0,
-        sample_rate: int = 16000,
+            self,
+            wavlm_src: str = "wavlm_large_s80_md",
+            wavlm_layer_num: int = 25,
+            wavlm_feat_dim: int = 1024,
+            attention_in: int = 256,
+            ffn_hidden: int = 1024,
+            num_head: int = 4,
+            num_layer: int = 4,
+            kernel_size: int = 31,
+            dropout: float = 0.1,
+            use_posi: bool = False,
+            output_activate_function: str = False,
+            max_speakers_per_chunk: int = 4,
+            max_speakers_per_frame: int = 4,
+            chunk_size: int = 5,
+            num_channels: int = 1,
+            selected_channel: int = 0,
+            sample_rate: int = 16000,
     ):
         super().__init__(
             num_channels=num_channels,
-            duration=chunk_size,
-            max_speakers_per_chunk=max_speakers_per_chunk,
-            max_speakers_per_frame=max_speakers_per_frame
         )
-        
+
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.selected_channel = selected_channel
+        self.max_speakers_per_chunk = max_speakers_per_chunk
+        self.max_speakers_per_frame = max_speakers_per_frame
 
-        # wavlm 
+        # 1. Manually define internal specifications
+        self._specifications = Specifications(
+            problem=Problem.MONO_LABEL_CLASSIFICATION,
+            resolution=Resolution.FRAME,
+            duration=chunk_size,
+            classes=[f"speaker_{i}" for i in range(max_speakers_per_chunk)],
+            powerset_max_classes=max_speakers_per_frame,
+            permutation_invariant=True
+        )
+
+        # 2. Create Powerset helper to calculate dimensions
+        self.powerset = Powerset(
+            len(self._specifications.classes),
+            self._specifications.powerset_max_classes
+        )
+
+        # wavlm
         self.wavlm_model = self.load_wavlm(wavlm_src)
         self.weight_sum = nn.Linear(wavlm_layer_num, 1, bias=False)
 
@@ -90,10 +107,10 @@ class Model(BaseModel):
         if isinstance(self.specifications, tuple):
             raise ValueError("PyanNet does not support multi-tasking.")
 
-        if self.specifications.powerset:
-            return self.specifications.num_powerset_classes
+        if self._specifications.powerset:
+            return self._specifications.num_powerset_classes
         else:
-            return len(self.specifications.classes)
+            return len(self._specifications.classes)
 
     @lru_cache
     def num_frames(self, num_samples: int) -> int:
@@ -123,30 +140,42 @@ class Model(BaseModel):
             dilation=dilation,
         )
 
+    # def receptive_field_size(self, num_frames: int = 1) -> int:
+    #     """Compute size of receptive field
+    #
+    #     Parameters
+    #     ----------
+    #     num_frames : int, optional
+    #         Number of frames in the output signal
+    #
+    #     Returns
+    #     -------
+    #     receptive_field_size : int
+    #         Receptive field size.
+    #     """
+    #
+    #     kernel_size = [10, 3, 3, 3, 3, 2, 2]
+    #     stride = [5, 2, 2, 2, 2, 2, 2]
+    #     dilation = [1, 1, 1, 1, 1, 1, 1]
+    #
+    #     return multi_conv_receptive_field_size(
+    #         num_frames,
+    #         kernel_size=kernel_size,
+    #         stride=stride,
+    #         dilation=dilation,
+    #     )
+
     def receptive_field_size(self, num_frames: int = 1) -> int:
-        """Compute size of receptive field
+        # WavLM large typically has a stride of 320 samples (20ms)
+        # Return a hardcoded value to bypass NoneType iteration error
+        return 320 + (num_frames - 1) * 320
 
-        Parameters
-        ----------
-        num_frames : int, optional
-            Number of frames in the output signal
-
-        Returns
-        -------
-        receptive_field_size : int
-            Receptive field size.
-        """
-
-        kernel_size = [10, 3, 3, 3, 3, 2, 2]
-        stride = [5, 2, 2, 2, 2, 2, 2]
-        dilation = [1, 1, 1, 1, 1, 1, 1]
-
-        return multi_conv_receptive_field_size(
-            num_frames,
-            kernel_size=kernel_size,
-            stride=stride,
-            dilation=dilation,
-        )
+    @property
+    def _receptive_field(self):
+        # This property is what the inference engine actually looks for
+        from pyannote.core import SlidingWindow
+        # 0.02 is the 20ms step for WavLM
+        return SlidingWindow(duration=0.02, step=0.02, start=0.0)
 
     def receptive_field_center(self, frame: int = 0) -> int:
         """Compute center of receptive field
@@ -174,9 +203,9 @@ class Model(BaseModel):
             padding=padding,
             dilation=dilation,
         )
-    
+
     @property
-    def get_rf_info(self):     
+    def get_rf_info(self):
         """Return receptive field info to dataset
         """
 
@@ -186,7 +215,7 @@ class Model(BaseModel):
         )
         num_frames = self.num_frames(self.chunk_size * self.sample_rate)
         duration = receptive_field_size / self.sample_rate
-        step=receptive_field_step / self.sample_rate
+        step = receptive_field_step / self.sample_rate
         return num_frames, duration, step
 
     def load_wavlm(self, source: str):
@@ -196,7 +225,7 @@ class Model(BaseModel):
         Parameters
         ----------
         source : str
-            - If `source` is a config name (e.g., "wavlm_large_md_s80"), 
+            - If `source` is a config name (e.g., "wavlm_large_md_s80"),
             the model will be initialized using predefined configuration via `get_config()`.
             - If `source` is a file path (e.g., "pytorch_model.bin", "model.ckpt", or any local .pt file),
             the model will be loaded from the checkpoint, using its saved 'config' and 'state_dict'.
@@ -227,14 +256,13 @@ class Model(BaseModel):
 
         return model
 
-
     def wav2wavlm(self, in_wav, model):
         """
         transform wav to wavlm features
         """
         layer_reps, _ = model.extract_features(in_wav)
         return torch.stack(layer_reps, dim=-1)
-    
+
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
         """Pass forward
 
@@ -255,7 +283,7 @@ class Model(BaseModel):
 
         outputs = self.proj(wavlm_feat)
         outputs = self.lnorm(outputs)
-        
+
         outputs = self.conformer(outputs)
 
         outputs = self.classifier(outputs)

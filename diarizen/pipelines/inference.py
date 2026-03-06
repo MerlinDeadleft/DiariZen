@@ -18,40 +18,124 @@ from huggingface_hub import snapshot_download, hf_hub_download
 from pyannote.audio.pipelines import SpeakerDiarization as SpeakerDiarizationPipeline
 from pyannote.audio.utils.signal import Binarize
 from pyannote.database.protocol.protocol import ProtocolFile
+from pyannote.audio.core.task import Problem, Resolution
+from pyannote.audio.core.model import Specifications
 
 from diarizen.pipelines.utils import scp2path
 
 from pyannote.audio import Model
+from unittest.mock import patch
+from types import SimpleNamespace
 
-# Store the original method so we can call it after modifying the data
+DIARIZEN_LOADING = False
+
+# Store the original method so it can be called after modifying the data
 original_from_pretrained = Model.from_pretrained
 
+
 @classmethod
-def patched_from_pretrained(cls, checkpoint_path, **kwargs):
-    # Load the checkpoint manually to inspect metadata
-    # We use map_location="cpu" to avoid moving data to GPU twice
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+def patched_from_pretrained(cls, *args, **kwargs):
+    checkpoint_path = args[0] if args else kwargs.get("checkpoint")
 
-    # BUT-FIT models lack the 'pyannote.audio' key required by pyannote 4.0+
-    if "pyannote.audio" not in checkpoint:
-        # Inject the missing version metadata
-        checkpoint["pyannote.audio"] = {"versions": {"pyannote.audio": "3.1.1"}}
-        # Pass the modified checkpoint directly to the original loader via kwargs
-        kwargs["checkpoint"] = checkpoint
+    if DIARIZEN_LOADING and isinstance(checkpoint_path, (str, os.PathLike)):
+        print(f"DEBUG: DiariZen patch bypassing load for: {checkpoint_path}")
 
-    return original_from_pretrained(checkpoint_path, **kwargs)
+        checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+        # 1. Inject missing version metadata
+        if "pyannote.audio" not in checkpoint_dict:
+            checkpoint_dict["pyannote.audio"] = {"versions": {"pyannote.audio": "3.1.1"}}
+
+        # 2. Inject architecture metadata to fix the KeyError
+        # This tells pyannote which class to use to load the weights
+        if "architecture" not in checkpoint_dict["pyannote.audio"]:
+            checkpoint_dict["pyannote.audio"]["architecture"] = {
+                "module": "diarizen.models.eend.model_wavlm_conformer",
+                "class": "Model"
+            }
+
+        # 3. Locate and Parse config.toml
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        config_path = os.path.join(checkpoint_dir, "config.toml")
+
+        # Fallback defaults
+        chunk_size = 16.0
+        max_speakers_per_chunk = 4
+        max_speakers_per_frame = 4
+
+        if os.path.exists(config_path):
+            try:
+                # Use tomllib (Python 3.11+) or toml package
+                try:
+                    import tomllib  # Standard library in 3.11+
+                    with open(config_path, "rb") as f:
+                        config = tomllib.load(f)
+                except ImportError:
+                    import toml  # Fallback for older python versions
+                    config = toml.load(config_path)
+
+                model_args = config.get("model", {}).get("args", {})
+                chunk_size = model_args.get("chunk_size", chunk_size)
+                max_speakers_per_chunk = model_args.get("max_speakers_per_chunk", max_speakers_per_chunk)
+                max_speakers_per_frame = model_args.get("max_speakers_per_frame", max_speakers_per_frame)
+
+                print(f"DEBUG: Dynamic patch loaded from TOML: chunk={chunk_size}, "
+                      f"max_spk_chunk={max_speakers_per_chunk}, max_spk_frame={max_speakers_per_frame}")
+            except Exception as e:
+                print(f"WARNING: Could not parse config.toml at {config_path}: {e}")
+
+        # 4. Inject specifications so pyannote doesn't throw a KeyError
+        # Recreate the specifications object to match what the model expects
+        # These values should match the model's defaults
+        checkpoint_dict["pyannote.audio"]["specifications"] = Specifications(
+            problem=Problem.MONO_LABEL_CLASSIFICATION,
+            resolution=Resolution.FRAME,
+            duration=chunk_size,
+            classes=[f"speaker_{i}" for i in range(max_speakers_per_chunk)],
+            powerset_max_classes=max_speakers_per_frame,
+            permutation_invariant=True
+        )
+
+        # 5. Inject Lightning version metadata
+        if "pytorch-lightning_version" not in checkpoint_dict:
+            # Set this to a standard version to skip migration logic
+            checkpoint_dict["pytorch-lightning_version"] = "2.1.0"
+
+        # 6. Ensure weights are nested under 'state_dict' for Lightning
+        if "state_dict" not in checkpoint_dict:
+            # Move all weights into a nested dictionary
+            # But avoid moving the metadata that was just added
+            metadata_keys = {"pyannote.audio", "pytorch-lightning_version"}
+            actual_weights = {k: v for k, v in checkpoint_dict.items() if k not in metadata_keys}
+
+            # Clean the top level
+            for k in list(checkpoint_dict.keys()):
+                if k not in metadata_keys:
+                    del checkpoint_dict[k]
+
+            # Re-insert weights under the expected key
+            checkpoint_dict["state_dict"] = actual_weights
+
+        # 7. Use mock to return our "enriched" dictionary
+        from unittest.mock import patch
+        with patch("torch.load", return_value=checkpoint_dict):
+            # Also clear duration/sample_rate from kwargs if pyannote injected them
+            return original_from_pretrained(*args, **kwargs)
+
+    return original_from_pretrained(*args, **kwargs)
 
 
-# Replace the original method with our patched version
+# Replace the original method
 Model.from_pretrained = patched_from_pretrained
+
 
 class DiariZenPipeline(SpeakerDiarizationPipeline):
     def __init__(
-        self, 
-        diarizen_hub,
-        embedding_model,
-        config_parse: Optional[Dict[str, Any]] = None,
-        rttm_out_dir: Optional[str] = None,
+            self,
+            diarizen_hub,
+            embedding_model,
+            config_parse: Optional[Dict[str, Any]] = None,
+            rttm_out_dir: Optional[str] = None,
     ):
         config_path = Path(diarizen_hub / "config.toml")
         config = toml.load(config_path.as_posix())
@@ -60,21 +144,33 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
             print('Overriding with parsed config.')
             config["inference"]["args"] = config_parse["inference"]["args"]
             config["clustering"]["args"] = config_parse["clustering"]["args"]
-       
+
         inference_config = config["inference"]["args"]
         clustering_config = config["clustering"]["args"]
-        
+
         print(f'Loaded configuration: {config}')
 
-        super().__init__(
-            segmentation=str(Path(diarizen_hub / "pytorch_model.bin")),
-            segmentation_step=inference_config["segmentation_step"],
-            embedding=embedding_model,
-            embedding_exclude_overlap=True,
-            clustering=clustering_config["method"],     
-            embedding_batch_size=inference_config["batch_size"],
-            segmentation_batch_size=inference_config["batch_size"],
-        )
+        # Check for CUDA availability
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        global DIARIZEN_LOADING
+        DIARIZEN_LOADING = True
+        try:
+            super().__init__(
+                segmentation=str(Path(diarizen_hub / "pytorch_model.bin")),
+                segmentation_step=inference_config["segmentation_step"],
+                embedding=embedding_model,
+                embedding_exclude_overlap=True,
+                clustering=clustering_config["method"],
+                embedding_batch_size=inference_config["batch_size"],
+                segmentation_batch_size=inference_config["batch_size"],
+            )
+
+            # Move the entire pipeline (models) to the detected device
+            self.to(self.device)
+        finally:
+            DIARIZEN_LOADING = False
 
         self.apply_median_filtering = inference_config["apply_median_filtering"]
         self.min_speakers = clustering_config["min_speakers"]
@@ -91,8 +187,7 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         elif clustering_config["method"] == "VBxClustering":
             self.PIPELINE_PARAMS = {
                 "clustering": {
-                    "ahc_criterion": clustering_config["ahc_criterion"],
-                    "ahc_threshold": clustering_config["ahc_threshold"],
+                    "threshold": clustering_config["ahc_threshold"],
                     "Fa": clustering_config["Fa"],
                     "Fb": clustering_config["Fb"],
                 }
@@ -113,10 +208,10 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
 
     @classmethod
     def from_pretrained(
-        cls, 
-        repo_id: str, 
-        cache_dir: str = None,
-        rttm_out_dir: str = None,
+            cls,
+            repo_id: str,
+            cache_dir: str = None,
+            rttm_out_dir: str = None,
     ) -> "DiariZenPipeline":
         diarizen_hub = snapshot_download(
             repo_id=repo_id,
@@ -137,20 +232,51 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
             rttm_out_dir=rttm_out_dir
         )
 
-    def __call__(self, in_wav, sess_name=None):
-        assert isinstance(in_wav, (str, ProtocolFile)), "input must be either a str or a ProtocolFile"
-        in_wav = in_wav if not isinstance(in_wav, ProtocolFile) else in_wav['audio']
-        
-        print('Extracting segmentations.')
-        waveform, sample_rate = torchaudio.load(in_wav) 
-        waveform = torch.unsqueeze(waveform[0], 0)      # force to use the SDM data
-        segmentations = self.get_segmentations({"waveform": waveform, "sample_rate": sample_rate}, soft=False)
+    def __call__(self, in_wav, sess_name=None, num_speakers=None, min_speakers=None, max_speakers=None):
+        # Handle WhisperX's Dictionary input: {'waveform': tensor, 'sample_rate': 16000}
+        if isinstance(in_wav, dict) and "waveform" in in_wav:
+            waveform = in_wav["waveform"]
+            sample_rate = in_wav.get("sample_rate", 16000)
+
+            # Ensure it's a float tensor on the correct device if needed
+            if isinstance(waveform, np.ndarray):
+                waveform = torch.from_numpy(waveform).float()
+            else:
+                waveform = waveform.float()
+
+        # Handle raw Array/Tensor input
+        elif hasattr(in_wav, "shape") and not isinstance(in_wav, str):
+            if isinstance(in_wav, torch.Tensor):
+                waveform = in_wav.float()
+            else:
+                waveform = torch.from_numpy(in_wav).float()
+            sample_rate = 16000
+
+        # Fallback for file paths (str or ProtocolFile)
+        else:
+            audio_path = in_wav if not isinstance(in_wav, ProtocolFile) else in_wav['audio']
+            waveform, sample_rate = torchaudio.load(audio_path)
+
+        # Standardize shape to (1, samples)
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        if waveform.shape[0] > 5:
+            waveform = waveform.T
+
+        # Ensure only the first channel (mono) is used for DiariZen
+        waveform = waveform[0:1, :]
+
+        # Ensure the waveform is on the correct device
+        waveform = waveform.to(self.device)
+
+        print(f'Extracting segmentations on {self.device} device.')
+        segmentations = self.get_segmentations({"waveform": waveform, "sample_rate": sample_rate})
 
         if self.apply_median_filtering:
             segmentations.data = median_filter(segmentations.data, size=(1, 11, 1), mode='reflect')
 
         # binarize segmentation
-        binarized_segmentations = segmentations     # powerset
+        binarized_segmentations = segmentations  # powerset
 
         # estimate frame-level number of instantaneous speakers
         count = self.speaker_count(
@@ -166,13 +292,16 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
             exclude_overlap=self.embedding_exclude_overlap,
         )
 
+        effective_min = num_speakers or min_speakers or self.min_speakers
+        effective_max = num_speakers or max_speakers or self.max_speakers
+
         # shape: (num_chunks, local_num_speakers, dimension)
         print("Clustering.")
         hard_clusters, _, _ = self.clustering(
             embeddings=embeddings,
             segmentations=binarized_segmentations,
-            min_clusters=self.min_speakers,  
-            max_clusters=self.max_speakers
+            min_clusters=effective_min,
+            max_clusters=effective_max
         )
 
         # during counting, we could possibly overcount the number of instantaneous
@@ -186,7 +315,7 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
 
         # reconstruct discrete diarization from raw hard clusters
         hard_clusters[inactive_speakers] = -2
-        discrete_diarization, _ = self.reconstruct(
+        discrete_diarization = self.reconstruct(
             segmentations,
             hard_clusters,
             count,
@@ -201,14 +330,14 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
         )
         result = to_annotation(discrete_diarization)
         result.uri = sess_name
-        
+
         if self.rttm_out_dir is not None:
             assert sess_name is not None
             rttm_out = os.path.join(self.rttm_out_dir, sess_name + ".rttm")
             with open(rttm_out, "w") as f:
                 f.write(result.to_rttm())
-        return result
-    
+        return SimpleNamespace(speaker_diarization=result)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
